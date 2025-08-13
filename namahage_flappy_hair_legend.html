@@ -1,0 +1,413 @@
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ナマハゲを避けろ！ハゲ！</title>
+<style>
+  html, body { height: 100%; margin: 0; background: #87CEEB; }
+  canvas { display: block; margin: 0 auto; background: linear-gradient(#8ed0ff,#bfe7ff); touch-action: manipulation; }
+  .overlay { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none; }
+  .panel { pointer-events: auto; background: rgba(255,255,255,0.92); padding: 16px 20px; border-radius: 14px; font-family: system-ui, sans-serif; text-align: center; box-shadow: 0 8px 24px rgba(0,0,0,.15); }
+  .btn { display:inline-block; margin-top:10px; padding:10px 16px; border-radius: 999px; background:#2563eb; color:#fff; text-decoration:none; font-weight:700; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui" class="overlay" style="display:none;">
+  <div class="panel">
+    <div id="title" style="font-size:20px; font-weight:700; margin-bottom:6px;">ナマハゲを避けろ！ハゲ！</div>
+    <div id="subtitle" style="font-size:14px; color:#333;">
+      タップ/スペースで「ピョン」！<br>
+      👹ドカンに3回当たるとゲームオーバー。<br>
+      🍃で加速、🎩で減速！<br>
+      🎩を取るとフッサフサに！ ダメージで徐々に薄く…
+    </div>
+    <a href="#" id="start" class="btn">スタート</a>
+  </div>
+</div>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const DPR = Math.min(2, window.devicePixelRatio || 1);
+  let W=0,H=0;
+  function resize(){
+    W = Math.min(window.innerWidth, 900);
+    H = Math.min(window.innerHeight, Math.floor(W*16/9)); // 16:9に収める
+    if (window.innerHeight > window.innerWidth) { H = Math.min(window.innerHeight, 720); W = Math.floor(H*9/16); }
+    canvas.style.width = W+'px'; canvas.style.height = H+'px';
+    canvas.width = Math.floor(W*DPR); canvas.height = Math.floor(H*DPR);
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  window.addEventListener('resize', resize, {passive:true});
+  resize();
+
+  // Game state
+  const state = {
+    phase: 'title', // title | play | over
+    t: 0,
+    player: { x: W*0.3, y: H*0.5, vy: 0, r: 18, invUntil: 0, hp: 3, hair: 1 }, // hair: 0..3
+    gravity: 0.35,
+    flap: -7.4,
+    pipes: [],
+    pipeGap: 210,         // 初期は広め
+    pipeW: 64,
+    pipeSpeed: 2.35,      // 初期はゆっくり
+    minSpeed: 1.6,
+    maxSpeed: 4.5,
+    spawnCd: 0,
+    spawnEvery: 1700,     // 初期はゆっくり湧く
+    score: 0,
+    best: 0,
+    // items
+    items: [],
+    itemChancePerPipe: 0.35, // パイプ1本ごとに出す確率
+  };
+
+  function reset() {
+    state.t = 0;
+    state.player = { x: W*0.3, y: H*0.5, vy: 0, r: 18, invUntil: 0, hp: 3, hair: 1 };
+    state.pipes = [];
+    state.items = [];
+    state.score = 0;
+    state.pipeGap = 210;
+    state.pipeSpeed = 2.35;
+    state.spawnEvery = 1700;
+    state.spawnCd = 0;
+    state.phase = 'play';
+    hideOverlay();
+  }
+
+  // Input
+  function flap() {
+    if (state.phase === 'title') { reset(); return; }
+    if (state.phase === 'over') { reset(); return; }
+    state.player.vy = state.flap;
+  }
+  canvas.addEventListener('touchstart', (e)=>{ e.preventDefault(); flap(); }, {passive:false});
+  window.addEventListener('mousedown', (e)=>{ flap(); });
+  window.addEventListener('keydown', (e)=>{ if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); flap(); }}, true);
+
+  // Overlay
+  const ui = document.getElementById('ui');
+  const startBtn = document.getElementById('start');
+  startBtn.addEventListener('click', (e)=>{ e.preventDefault(); reset(); });
+  function showOverlay(title, sub, buttonText='スタート') {
+    document.getElementById('title').textContent = title;
+    document.getElementById('subtitle').innerHTML = sub;
+    startBtn.textContent = buttonText;
+    ui.style.display = 'grid';
+  }
+  function hideOverlay() { ui.style.display = 'none'; }
+  showOverlay('ナマハゲを避けろ！ハゲ！', 'タップ/スペースで「ピョン」！<br>👹ドカンに3回当たるとゲームオーバー。<br>🍃で加速、🎩で減速！<br>🎩を取るとフッサフサに！ ダメージで徐々に薄く…');
+
+  // Helpers
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+
+  function spawnPipe() {
+    const gap = state.pipeGap + rand(-18, 18);
+    const minTop = 40;
+    const maxTop = H - gap - 80;
+    const topH = Math.max(minTop, Math.min(maxTop, rand(minTop, maxTop)));
+    const bottomY = topH + gap;
+    const p = { x: W + 40, w: state.pipeW, top: topH, bottomY: bottomY, passed: false };
+    state.pipes.push(p);
+
+    // アイテム：このパイプ区間にたまに出す（隙間中央あたり）
+    if (Math.random() < state.itemChancePerPipe) {
+      const centerY = (topH + bottomY) / 2 + rand(-gap*0.25, gap*0.25);
+      const kind = Math.random() < 0.5 ? 'leaf' : 'hat'; // 🍃 or 🎩
+      const item = { x: p.x + state.pipeW + 140, y: centerY, r: 14, kind };
+      state.items.push(item);
+    }
+  }
+
+  function circleRectCollide(cx, cy, r, rx, ry, rw, rh) {
+    const closestX = Math.max(rx, Math.min(cx, rx + rw));
+    const closestY = Math.max(ry, Math.min(cy, ry + rh));
+    const dx = cx - closestX;
+    const dy = cy - closestY;
+    return (dx*dx + dy*dy) <= r*r;
+  }
+
+  function hitPipe() {
+    const now = performance.now();
+    if (now < state.player.invUntil) return; // 無敵中はノーダメ
+    state.player.hp -= 1;
+    state.player.hair = Math.max(0, state.player.hair - 1); // 当たるたび寂しく
+    state.player.invUntil = now + 1200; // 1.2秒点滅
+    // 当たったら難易度アップ：隙間縮小＆出現間隔少し短く
+    state.pipeGap = Math.max(120, state.pipeGap - 20);
+    state.spawnEvery = Math.max(900, state.spawnEvery - 120);
+    if (state.player.hp <= 0) {
+      gameOver();
+    }
+  }
+
+  function takeItem(item) {
+    // 🍃: 速度UP, 🎩: 速度DOWN & フサフサ
+    if (item.kind === 'leaf') {
+      state.pipeSpeed = clamp(state.pipeSpeed + 0.45, state.minSpeed, state.maxSpeed);
+    } else if (item.kind === 'hat')  {
+      state.pipeSpeed = clamp(state.pipeSpeed - 0.5, state.minSpeed, state.maxSpeed);
+      state.player.hair = 3; // フサフサ！
+    }
+  }
+
+  function update(dt) {
+    state.t += dt;
+    if (state.phase !== 'play') return;
+
+    // gravity
+    state.player.vy += state.gravity;
+    state.player.y += state.player.vy;
+
+    // spawn pipes
+    state.spawnCd -= dt*1000;
+    if (state.spawnCd <= 0) {
+      spawnPipe();
+      state.spawnCd = state.spawnEvery;
+      // 自動でも少しずつ難しく
+      if (state.pipeGap > 140) state.pipeGap -= 0.2;
+      state.pipeSpeed = clamp(state.pipeSpeed + 0.0015, state.minSpeed, state.maxSpeed);
+      if (state.spawnEvery > 1000) state.spawnEvery -= 1.5;
+    }
+
+    // move pipes & scoring
+    for (let i = state.pipes.length-1; i >= 0; i--) {
+      const p = state.pipes[i];
+      p.x -= state.pipeSpeed;
+      // score when player passes pipe center
+      const passLine = p.x + p.w;
+      if (!p.passed && passLine < state.player.x - state.player.r) {
+        p.passed = true;
+        state.score += 1;
+      }
+      if (p.x + p.w < -10) state.pipes.splice(i,1);
+    }
+
+    // move items
+    for (let i = state.items.length-1; i >= 0; i--) {
+      const it = state.items[i];
+      it.x -= state.pipeSpeed;
+      // pickup
+      const dx = state.player.x - it.x;
+      const dy = state.player.y - it.y;
+      if (dx*dx + dy*dy <= Math.pow(state.player.r + it.r, 2)) {
+        takeItem(it);
+        state.items.splice(i,1);
+        continue;
+      }
+      if (it.x < -40) state.items.splice(i,1);
+    }
+
+    // Collision with ground/ceiling
+    if (state.player.y - state.player.r < 0 || state.player.y + state.player.r > H) {
+      hitPipe();
+      // 画面外に出た場合は少し戻す
+      state.player.y = clamp(state.player.y, state.player.r+1, H - state.player.r - 1);
+      // 速度は反転小
+      state.player.vy *= -0.4;
+    }
+
+    // Collision with pipes
+    for (const p of state.pipes) {
+      if (circleRectCollide(state.player.x, state.player.y, state.player.r, p.x, 0, state.pipeW, p.top)) { hitPipe(); }
+      if (circleRectCollide(state.player.x, state.player.y, state.player.r, p.x, p.bottomY, state.pipeW, H - p.bottomY)) { hitPipe(); }
+    }
+  }
+
+  function gameOver() {
+    state.best = Math.max(state.best, state.score);
+    state.phase = 'over';
+    showOverlay('ゲームオーバー', `スコア：${state.score}　/　ベスト：${state.best}<br>タップでリスタート`, 'もう一度');
+  }
+
+  // Hair drawing helper
+  function drawHair(px, py, r, level) {
+    // level: 0=つるつる, 1=前髪ちょろ, 2=そこそこ, 3=フサフサ
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.fillStyle = '#3b82f6'; // 髪色（青っぽい・見やすい）
+    if (level >= 1) {
+      // 前髪ちょろ
+      ctx.beginPath();
+      ctx.ellipse(0, -r*0.6, r*0.6, r*0.35, 0, Math.PI, 0);
+      ctx.fill();
+    }
+    if (level >= 2) {
+      // サイド
+      ctx.beginPath();
+      ctx.ellipse(-r*0.55, -r*0.2, r*0.25, r*0.45, Math.PI/8, 0, Math.PI*2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.ellipse(r*0.55, -r*0.2, r*0.25, r*0.45, -Math.PI/8, 0, Math.PI*2);
+      ctx.fill();
+    }
+    if (level >= 3) {
+      // トップ盛り
+      ctx.beginPath();
+      ctx.ellipse(0, -r*0.9, r*0.9, r*0.5, 0, Math.PI, 0);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Draw
+  function draw() {
+    // sky
+    ctx.fillStyle = '#8ed0ff';
+    ctx.fillRect(0,0,W,H);
+
+    // legend (item explanation)
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillRect(8, 8, 210, 28);
+    ctx.fillStyle = '#111';
+    ctx.font = '16px system-ui, sans-serif';
+    ctx.fillText('🍃 速くなる / 🎩 遅くなる', 14, 28);
+
+    // ground (装飾ライン)
+    ctx.fillStyle = 'rgba(255,255,255,.25)';
+    for (let y=0; y<H; y+=40) ctx.fillRect(0, y, W, 1);
+
+    // pipes
+    for (const p of state.pipes) {
+      // top
+      ctx.fillStyle = '#2dd4bf';
+      ctx.fillRect(p.x, 0, state.pipeW, p.top);
+      ctx.fillStyle = '#14b8a6';
+      ctx.fillRect(p.x-6, p.top-14, state.pipeW+12, 14);
+      // bottom
+      const bottomH = H - p.bottomY;
+      ctx.fillStyle = '#2dd4bf';
+      ctx.fillRect(p.x, p.bottomY, state.pipeW, bottomH);
+      ctx.fillStyle = '#14b8a6';
+      ctx.fillRect(p.x-6, p.bottomY, state.pipeW+12, 14);
+
+      // decorative 👹 on pipes
+      ctx.font = '24px serif';
+      ctx.fillText('👹', p.x + state.pipeW/2 - 12, p.top - 8);
+      ctx.fillText('👹', p.x + state.pipeW/2 - 12, p.bottomY + 30);
+    }
+
+    // items
+    for (const it of state.items) {
+      ctx.font = '26px serif';
+      ctx.fillText(it.kind === 'leaf' ? '🍃' : '🎩', it.x - 13, it.y + 10);
+    }
+
+    // player (👴) with blink on i-frames + hair
+    const pr = state.player.r;
+    const now = performance.now();
+    const blinking = now < state.player.invUntil && Math.floor(now/100)%2===0;
+    if (!blinking) {
+      // head
+      ctx.beginPath();
+      ctx.fillStyle = '#fde047';
+      ctx.arc(state.player.x, state.player.y, pr, 0, Math.PI*2);
+      ctx.fill();
+      // face (emoji)
+      ctx.font = '20px serif';
+      ctx.fillText('👴', state.player.x - 12, state.player.y + 8);
+      // hair overlay
+      drawHair(state.player.x, state.player.y, pr, state.player.hair);
+    }
+
+    // score & HP
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = 'rgba(0,0,0,.25)';
+    ctx.lineWidth = 4;
+    ctx.font = '28px system-ui, sans-serif';
+    const s = `SCORE: ${state.score}`;
+    ctx.strokeText(s, 12, 64);
+    ctx.fillText(s, 12, 64);
+
+    // hearts
+    for (let i=0;i<3;i++){
+      ctx.font = '22px serif';
+      const heart = i < state.player.hp ? '❤️' : '🤍';
+      ctx.fillText(heart, W - 30 - i*26, 30);
+    }
+
+    // speed indicator (small)
+    ctx.font = '14px system-ui';
+    ctx.fillStyle = 'rgba(0,0,0,.55)';
+    ctx.fillText(`speed:${state.pipeSpeed.toFixed(2)} gap:${Math.floor(state.pipeGap)}`, 12, 86);
+  }
+
+  // Loop
+  function update(dt) {
+    state.t += dt;
+    if (state.phase !== 'play') return;
+
+    // gravity
+    state.player.vy += state.gravity;
+    state.player.y += state.player.vy;
+
+    // spawn pipes
+    state.spawnCd -= dt*1000;
+    if (state.spawnCd <= 0) {
+      spawnPipe();
+      state.spawnCd = state.spawnEvery;
+      // 自動でも少しずつ難しく
+      if (state.pipeGap > 140) state.pipeGap -= 0.2;
+      state.pipeSpeed = clamp(state.pipeSpeed + 0.0015, state.minSpeed, state.maxSpeed);
+      if (state.spawnEvery > 1000) state.spawnEvery -= 1.5;
+    }
+
+    // move pipes & scoring
+    for (let i = state.pipes.length-1; i >= 0; i--) {
+      const p = state.pipes[i];
+      p.x -= state.pipeSpeed;
+      const passLine = p.x + p.w;
+      if (!p.passed && passLine < state.player.x - state.player.r) {
+        p.passed = true;
+        state.score += 1;
+      }
+      if (p.x + p.w < -10) state.pipes.splice(i,1);
+    }
+
+    // move items
+    for (let i = state.items.length-1; i >= 0; i--) {
+      const it = state.items[i];
+      it.x -= state.pipeSpeed;
+      const dx = state.player.x - it.x;
+      const dy = state.player.y - it.y;
+      if (dx*dx + dy*dy <= Math.pow(state.player.r + it.r, 2)) {
+        takeItem(it);
+        state.items.splice(i,1);
+        continue;
+      }
+      if (it.x < -40) state.items.splice(i,1);
+    }
+
+    // Collision with ground/ceiling
+    if (state.player.y - state.player.r < 0 || state.player.y + state.player.r > H) {
+      hitPipe();
+      state.player.y = clamp(state.player.y, state.player.r+1, H - state.player.r - 1);
+      state.player.vy *= -0.4;
+    }
+
+    // Collision with pipes
+    for (const p of state.pipes) {
+      if (circleRectCollide(state.player.x, state.player.y, state.player.r, p.x, 0, state.pipeW, p.top)) { hitPipe(); }
+      if (circleRectCollide(state.player.x, state.player.y, state.player.r, p.x, p.bottomY, state.pipeW, H - p.bottomY)) { hitPipe(); }
+    }
+  }
+
+  let last = performance.now();
+  function loop(t) {
+    const dt = Math.min(0.033, (t - last)/1000);
+    last = t;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
